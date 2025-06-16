@@ -155,3 +155,65 @@ class Store(db.Model):
     
     def __repr__(self):
         return f'<Store {self.store_name} ({self.store_id})>'
+
+
+
+        """Convert store to dictionary."""
+        return {
+            'id': self.id,
+            'store_id': self.store_id,
+            'store_name': self.store_name,
+            'store_description': self.store_description,
+            'domain': self.domain,
+            'subdomain': self.subdomain,
+            'custom_domain': self.custom_domain,
+            'owner_name': self.owner_name,
+            'owner_email': self.owner_email,
+            'owner_phone': self.owner_phone,
+            'business_name': self.business_name,
+            'business_type': self.business_type,
+            'business_registration': self.business_registration,
+            'tax_id': self.tax_id,
+            'is_active': self.is_active,
+            'is_setup_complete': self.is_setup_complete,
+            'subscription_status': self.subscription_status,
+            'plan_type': self.plan_type,
+            'max_products': self.max_products,
+            'max_storage_mb': self.max_storage_mb,
+            'max_orders_per_month': self.max_orders_per_month,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+            'setup_completed_at': self.setup_completed_at.isoformat() if self.setup_completed_at else None,
+            'last_activity': self.last_activity.isoformat() if self.last_activity else None,
+            'subscription_start': self.subscription_start.isoformat() if self.subscription_start else None,
+            'subscription_end': self.subscription_end.isoformat() if self.subscription_end else None
+        }
+    
+    def get_store_url(self):
+        """Get full store URL."""
+        if self.custom_domain:
+            return f"https://{self.custom_domain}"
+        return f"https://{self.subdomain}.{self.domain}"
+    
+    def get_admin_url(self):
+        """Get admin panel URL."""
+        return f"https://admin.{self.domain}"
+    
+    @classmethod
+    def get_by_store_id(cls, store_id):
+        """Get store by store_id."""
+        return cls.query.filter_by(store_id=store_id).first()
+    
+    @classmethod
+    def get_by_domain(cls, domain):
+        """Get store by domain or subdomain."""
+        return cls.query.filter(
+            (cls.domain == domain) | 
+            (cls.subdomain == domain) | 
+            (cls.custom_domain == domain)
+        ).first()
+    
+    def update_last_activity(self):
+        """Update last activity timestamp."""
+        self.last_activity = datetime.utcnow()
+        db.session.commit()
