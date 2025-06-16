@@ -1,4 +1,82 @@
-rates.append(rate_data)
+"""
+Shipping service for handling shipping operations and partner integrations.
+"""
+
+import requests
+import json
+from datetime import datetime, timedelta
+from flask import current_app
+from app.config.database import db
+from app.models.shipping_partner import ShippingPartner
+from app.models.order import Order
+import logging
+
+class ShippingService:
+    """Service for handling shipping operations."""
+    
+    @staticmethod
+    def calculate_shipping_rates(store_id, weight, dimensions, origin_pincode, destination_pincode, order_value=0):
+        """Calculate shipping rates from all available partners."""
+        try:
+            partners = ShippingPartner.get_active_partners(store_id)
+            
+            if not partners:
+                return {
+                    'success': False,
+                    'message': 'No shipping partners available',
+                    'code': 'NO_PARTNERS_AVAILABLE'
+                }
+            
+            rates = []
+            for partner in partners:
+                # Check if partner services the destination
+                if not partner.is_serviceable(destination_pincode):
+                    continue
+                
+                # Check weight limits
+                if not partner.is_weight_acceptable(weight):
+                    continue
+                
+                # Check dimensions if provided
+                if dimensions and not partner.is_dimensions_acceptable(
+                    dimensions.get('length', 0),
+                    dimensions.get('width', 0), 
+                    dimensions.get('height', 0)
+                ):
+                    continue
+                
+                # Calculate rate based on partner type
+                if partner.partner_name == 'shiprocket':
+                    rate_result = ShippingService._calculate_shiprocket_rate(
+                        partner, weight, dimensions, origin_pincode, destination_pincode, order_value
+                    )
+                elif partner.partner_name == 'delhivery':
+                    rate_result = ShippingService._calculate_delhivery_rate(
+                        partner, weight, dimensions, origin_pincode, destination_pincode, order_value
+                    )
+                else:
+                    # Use generic calculation
+                    rate_result = partner.calculate_shipping_cost(weight, dimensions, destination_pincode)
+                    if rate_result:
+                        rate_result = {
+                            'success': True,
+                            'data': {
+                                'rate': rate_result,
+                                'service_type': 'standard',
+                                'estimated_days': partner.get_delivery_estimate()
+                            }
+                        }
+                
+                if rate_result and rate_result.get('success'):
+                    rate_data = rate_result['data']
+                    rate_data.update({
+                        'partner_id': partner.id,
+                        'partner_name': partner.partner_name,
+                        'display_name': partner.display_name,
+                        'supports_cod': partner.supports_cod,
+                        'supports_tracking': partner.supports_tracking
+                    })
+                    rates.append(rate_data)
             
             # Sort by rate (cheapest first)
             rates.sort(key=lambda x: x.get('rate', float('inf')))
@@ -963,81 +1041,332 @@ rates.append(rate_data)
                 'success': False,
                 'message': 'Failed to get delivery estimates',
                 'code': 'DELIVERY_ESTIMATES_ERROR'
-            }"""
-Shipping service for handling shipping operations and partner integrations.
-"""
-
-import requests
-import json
-from datetime import datetime, timedelta
-from flask import current_app
-from app.config.database import db
-from app.models.shipping_partner import ShippingPartner
-from app.models.order import Order
-import logging
-
-class ShippingService:
-    """Service for handling shipping operations."""
+            }
     
     @staticmethod
-    def calculate_shipping_rates(store_id, weight, dimensions, origin_pincode, destination_pincode, order_value=0):
-        """Calculate shipping rates from all available partners."""
+    def update_shipment_status(store_id, tracking_number, new_status, location=None, notes=None):
+        """Update shipment status manually."""
         try:
-            partners = ShippingPartner.get_active_partners(store_id)
+            order = Order.query.filter_by(
+                store_id=store_id,
+                tracking_number=tracking_number
+            ).first()
             
-            if not partners:
+            if not order:
                 return {
                     'success': False,
-                    'message': 'No shipping partners available',
-                    'code': 'NO_PARTNERS_AVAILABLE'
+                    'message': 'Order not found',
+                    'code': 'ORDER_NOT_FOUND'
                 }
             
-            rates = []
-            for partner in partners:
-                # Check if partner services the destination
-                if not partner.is_serviceable(destination_pincode):
-                    continue
+            # Update fulfillment status
+            order.fulfillment_status = new_status
+            
+            # Update timestamps based on status
+            if new_status == 'shipped' and not order.shipped_at:
+                order.shipped_at = datetime.utcnow()
+            elif new_status == 'delivered' and not order.delivered_at:
+                order.delivered_at = datetime.utcnow()
+            
+            db.session.commit()
+            
+            return {
+                'success': True,
+                'message': 'Shipment status updated successfully',
+                'data': {
+                    'tracking_number': tracking_number,
+                    'new_status': new_status,
+                    'updated_at': datetime.utcnow().isoformat()
+                }
+            }
+            
+        except Exception as e:
+            logging.error(f"Update shipment status error: {str(e)}")
+            return {
+                'success': False,
+                'message': 'Failed to update shipment status',
+                'code': 'STATUS_UPDATE_ERROR'
+            }
+    
+    @staticmethod
+    def get_shipping_analytics(store_id, start_date=None, end_date=None):
+        """Get shipping analytics for store."""
+        try:
+            # Set default date range if not provided
+            if not end_date:
+                end_date = datetime.utcnow()
+            if not start_date:
+                start_date = end_date - timedelta(days=30)
+            
+            # Query orders with shipping data
+            orders = Order.query.filter(
+                Order.store_id == store_id,
+                Order.created_at >= start_date,
+                Order.created_at <= end_date,
+                Order.tracking_number.isnot(None)
+            ).all()
+            
+            analytics = {
+                'total_shipments': len(orders),
+                'delivered': len([o for o in orders if o.fulfillment_status == 'delivered']),
+                'in_transit': len([o for o in orders if o.fulfillment_status == 'shipped']),
+                'cancelled': len([o for o in orders if o.fulfillment_status == 'cancelled']),
+                'pending': len([o for o in orders if o.fulfillment_status == 'pending']),
+                'partner_breakdown': {},
+                'avg_delivery_time': 0,
+                'total_shipping_cost': 0
+            }
+            
+            # Calculate partner breakdown
+            for order in orders:
+                partner = order.shipping_partner or 'local'
+                if partner not in analytics['partner_breakdown']:
+                    analytics['partner_breakdown'][partner] = {
+                        'count': 0,
+                        'delivered': 0,
+                        'cancelled': 0,
+                        'total_cost': 0
+                    }
                 
-                # Check weight limits
-                if not partner.is_weight_acceptable(weight):
-                    continue
+                analytics['partner_breakdown'][partner]['count'] += 1
+                if order.fulfillment_status == 'delivered':
+                    analytics['partner_breakdown'][partner]['delivered'] += 1
+                elif order.fulfillment_status == 'cancelled':
+                    analytics['partner_breakdown'][partner]['cancelled'] += 1
                 
-                # Check dimensions if provided
-                if dimensions and not partner.is_dimensions_acceptable(
-                    dimensions.get('length', 0),
-                    dimensions.get('width', 0), 
-                    dimensions.get('height', 0)
-                ):
-                    continue
-                
-                # Calculate rate based on partner type
-                if partner.partner_name == 'shiprocket':
-                    rate_result = ShippingService._calculate_shiprocket_rate(
-                        partner, weight, dimensions, origin_pincode, destination_pincode, order_value
-                    )
-                elif partner.partner_name == 'delhivery':
-                    rate_result = ShippingService._calculate_delhivery_rate(
-                        partner, weight, dimensions, origin_pincode, destination_pincode, order_value
-                    )
-                else:
-                    # Use generic calculation
-                    rate_result = partner.calculate_shipping_cost(weight, dimensions, destination_pincode)
-                    if rate_result:
-                        rate_result = {
-                            'success': True,
-                            'data': {
-                                'rate': rate_result,
-                                'service_type': 'standard',
-                                'estimated_days': partner.get_delivery_estimate()
-                            }
-                        }
-                
-                if rate_result and rate_result.get('success'):
-                    rate_data = rate_result['data']
-                    rate_data.update({
-                        'partner_id': partner.id,
-                        'partner_name': partner.partner_name,
-                        'display_name': partner.display_name,
-                        'supports_cod': partner.supports_cod,
-                        'supports_tracking': partner.supports_tracking
+                if order.shipping_amount:
+                    analytics['partner_breakdown'][partner]['total_cost'] += float(order.shipping_amount)
+                    analytics['total_shipping_cost'] += float(order.shipping_amount)
+            
+            # Calculate average delivery time for delivered orders
+            delivered_orders = [o for o in orders if o.fulfillment_status == 'delivered' and o.shipped_at and o.delivered_at]
+            if delivered_orders:
+                total_delivery_time = sum(
+                    (order.delivered_at - order.shipped_at).days 
+                    for order in delivered_orders
+                )
+                analytics['avg_delivery_time'] = total_delivery_time / len(delivered_orders)
+            
+            return {
+                'success': True,
+                'message': 'Shipping analytics retrieved successfully',
+                'data': {
+                    'period': {
+                        'start_date': start_date.isoformat(),
+                        'end_date': end_date.isoformat()
+                    },
+                    'analytics': analytics
+                }
+            }
+            
+        except Exception as e:
+            logging.error(f"Get shipping analytics error: {str(e)}")
+            return {
+                'success': False,
+                'message': 'Failed to retrieve shipping analytics',
+                'code': 'ANALYTICS_ERROR'
+            }
+    
+    @staticmethod
+    def bulk_update_tracking(store_id, tracking_updates):
+        """Bulk update tracking information for multiple orders."""
+        try:
+            updated_orders = []
+            failed_updates = []
+            
+            for update in tracking_updates:
+                try:
+                    order_id = update.get('order_id')
+                    tracking_number = update.get('tracking_number')
+                    status = update.get('status')
+                    
+                    order = Order.query.filter_by(
+                        id=order_id,
+                        store_id=store_id
+                    ).first()
+                    
+                    if not order:
+                        failed_updates.append({
+                            'order_id': order_id,
+                            'error': 'Order not found'
+                        })
+                        continue
+                    
+                    # Update order
+                    if tracking_number:
+                        order.tracking_number = tracking_number
+                    if status:
+                        order.fulfillment_status = status
+                        if status == 'shipped' and not order.shipped_at:
+                            order.shipped_at = datetime.utcnow()
+                        elif status == 'delivered' and not order.delivered_at:
+                            order.delivered_at = datetime.utcnow()
+                    
+                    updated_orders.append({
+                        'order_id': order_id,
+                        'order_number': order.order_number,
+                        'tracking_number': order.tracking_number,
+                        'status': order.fulfillment_status
                     })
+                    
+                except Exception as e:
+                    failed_updates.append({
+                        'order_id': update.get('order_id'),
+                        'error': str(e)
+                    })
+            
+            db.session.commit()
+            
+            return {
+                'success': True,
+                'message': f'Bulk update completed. Updated: {len(updated_orders)}, Failed: {len(failed_updates)}',
+                'data': {
+                    'updated_orders': updated_orders,
+                    'failed_updates': failed_updates,
+                    'summary': {
+                        'total_processed': len(tracking_updates),
+                        'successful_updates': len(updated_orders),
+                        'failed_updates': len(failed_updates)
+                    }
+                }
+            }
+            
+        except Exception as e:
+            db.session.rollback()
+            logging.error(f"Bulk update tracking error: {str(e)}")
+            return {
+                'success': False,
+                'message': 'Bulk tracking update failed',
+                'code': 'BULK_UPDATE_ERROR'
+            }
+    
+    @staticmethod
+    def test_partner_connection(store_id, partner_id):
+        """Test connection to shipping partner API."""
+        try:
+            partner = ShippingPartner.query.filter_by(
+                id=partner_id,
+                store_id=store_id
+            ).first()
+            
+            if not partner:
+                return {
+                    'success': False,
+                    'message': 'Shipping partner not found',
+                    'code': 'PARTNER_NOT_FOUND'
+                }
+            
+            # Test connection based on partner type
+            if partner.partner_name == 'shiprocket':
+                return ShippingService._test_shiprocket_connection(partner)
+            elif partner.partner_name == 'delhivery':
+                return ShippingService._test_delhivery_connection(partner)
+            else:
+                # For local/generic partners, always return success
+                return {
+                    'success': True,
+                    'message': 'Local shipping partner connection successful',
+                    'data': {
+                        'partner_name': partner.partner_name,
+                        'test_result': 'Connection OK'
+                    }
+                }
+            
+        except Exception as e:
+            logging.error(f"Test partner connection error: {str(e)}")
+            return {
+                'success': False,
+                'message': 'Partner connection test failed',
+                'code': 'CONNECTION_TEST_ERROR'
+            }
+    
+    @staticmethod
+    def _test_shiprocket_connection(partner):
+        """Test Shiprocket API connection."""
+        try:
+            config = partner.get_api_config()
+            
+            # Test authentication
+            token_result = ShippingService._get_shiprocket_token(config)
+            if not token_result['success']:
+                return {
+                    'success': False,
+                    'message': 'Shiprocket authentication failed',
+                    'code': 'SHIPROCKET_AUTH_FAILED'
+                }
+            
+            token = token_result['data']['token']
+            
+            # Test API call - get user profile
+            response = requests.get(
+                f"{current_app.config['SHIPROCKET_API_URL']}/settings/company/pickup",
+                headers={
+                    'Content-Type': 'application/json',
+                    'Authorization': f'Bearer {token}'
+                }
+            )
+            
+            if response.status_code == 200:
+                return {
+                    'success': True,
+                    'message': 'Shiprocket connection successful',
+                    'data': {
+                        'partner_name': 'shiprocket',
+                        'test_result': 'API connection OK',
+                        'response_status': response.status_code
+                    }
+                }
+            else:
+                return {
+                    'success': False,
+                    'message': f'Shiprocket API test failed with status {response.status_code}',
+                    'code': 'SHIPROCKET_API_TEST_FAILED'
+                }
+            
+        except Exception as e:
+            logging.error(f"Shiprocket connection test error: {str(e)}")
+            return {
+                'success': False,
+                'message': 'Shiprocket connection test failed',
+                'code': 'SHIPROCKET_TEST_ERROR'
+            }
+    
+    @staticmethod
+    def _test_delhivery_connection(partner):
+        """Test Delhivery API connection."""
+        try:
+            config = partner.get_api_config()
+            
+            # Test API call - get package status
+            response = requests.get(
+                'https://track.delhivery.com/api/cmu/klm.json',
+                headers={
+                    'Authorization': f'Token {config.get("api_token")}',
+                    'Content-Type': 'application/json'
+                }
+            )
+            
+            if response.status_code == 200:
+                return {
+                    'success': True,
+                    'message': 'Delhivery connection successful',
+                    'data': {
+                        'partner_name': 'delhivery',
+                        'test_result': 'API connection OK',
+                        'response_status': response.status_code
+                    }
+                }
+            else:
+                return {
+                    'success': False,
+                    'message': f'Delhivery API test failed with status {response.status_code}',
+                    'code': 'DELHIVERY_API_TEST_FAILED'
+                }
+            
+        except Exception as e:
+            logging.error(f"Delhivery connection test error: {str(e)}")
+            return {
+                'success': False,
+                'message': 'Delhivery connection test failed',
+                'code': 'DELHIVERY_TEST_ERROR'
+            }
